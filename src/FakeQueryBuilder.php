@@ -10,4 +10,13 @@ class FakeQueryBuilder extends Builder
     {
         return $this;
     }
+
+    public function truncate()
+    {
+        if (method_exists($this, 'applyBeforeQueryCallbacks')) {
+            $this->applyBeforeQueryCallbacks();
+        }
+
+        $this->connection->affectingStatement($this->grammar->compileTruncate($this));
+    }
 }

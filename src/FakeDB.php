@@ -17,6 +17,8 @@ class FakeDB
 
     public static $fakeRows = [];
 
+    public static $schema = [];
+
     public static $changedModels = [];
 
     public static $tables = [];
@@ -34,12 +36,33 @@ class FakeDB
         foreach (FakeDB::$fakeRows[$table] ?? [] as $row) {
         }
 
-        return $row;
+        return $row[$table] ?? [];
+    }
+
+    public static function createTable($args)
+    {
+        /**
+         * @var $blueprint \Illuminate\Database\Schema\Blueprint
+         */
+        [$blueprint, $fluent, $connection] = $args;
+        $table = $blueprint->getTable();
+        self::$schema[$table]['columns'] = $columns = $blueprint->getColumns();
+
+        foreach ($columns as $column) {
+            /**
+             * @var $column \Illuminate\Database\Schema\ColumnDefinition
+             */
+            $column = $column->getAttributes();
+            if ($column['autoIncrement'] ?? null) {
+                self::$schema[$table]['primaryKey'] = $column['name'];
+                break;
+            }
+        }
     }
 
     public static function table($table)
     {
-        return new class ($table){
+        return new class ($table) {
             private $table;
 
             public function __construct($table)
@@ -51,31 +74,42 @@ class FakeDB
             {
                 FakeDB::addRow($this->table, $row);
             }
+
+            public function allRows()
+            {
+                $rows = [];
+                foreach((FakeDB::$fakeRows[$this->table] ?? []) as $i => $row) {
+                    $rows[$i] = $row[$this->table];
+                }
+
+                return $rows;
+            }
+
+            public function count()
+            {
+                return count(FakeDB::$fakeRows[$this->table] ?? []);
+            }
         };
     }
 
-    public static function getChangedModel(string $action, $index, $model)
+    public static function truncate($query = null)
     {
-        return FakeDB::$changedModels[$model][$action][$index] ?? null;
-    }
-
-    public static function setChangedModel(string $action, $model)
-    {
-        FakeDB::$changedModels[get_class($model)][$action][] = $model;
-    }
-
-    public static function truncate()
-    {
-        self::$fakeRows = [];
-        self::$changedModels = [];
-        self::$tables = [];
-        self::$deletedRows = [];
+        if ($query) {
+            $table = $query['builder']->from;
+            unset(self::$tables[$table]);
+            unset(self::$fakeRows[$table]);
+        } else {
+            self::$fakeRows = [];
+            self::$changedModels = [];
+            self::$tables = [];
+            self::$deletedRows = [];
+        }
     }
 
     public static function mockQueryBuilder()
     {
-        Connection::resolverFor('arrayDB', function () {
-            return FakeConnection::resolve();
+        Connection::resolverFor('arrayDB', function ($connection, $db, $prefix, $config) {
+            return FakeConnection::resolve($connection, $db, $prefix, $config);
         });
 
         $resolver = new ConnectionResolver(['arrayDB' => FakeConnection::resolve()]);
@@ -291,6 +325,10 @@ class FakeDB
                 }
                 $collection = self::applyBasicWhere($where, $table, $query, $collection);
             } elseif ($type === 'Column' && $where['boolean'] === 'and') {
+                if (strpos($where['first'], '.') && strpos($where['second'], '.')) {
+                    return self::applyWhereColumns($where);
+                }
+
                 $collection = $collection->filter(function ($row) use ($where, $table) {
                     return self::whereColumn($where, $row[$table]);
                 });
@@ -306,6 +344,8 @@ class FakeDB
                     $method = $where['not'] ? 'whereNotBetween' : 'whereBetween';
                 }
                 $collection = $collection->$method($column, $value);
+            } elseif ($type === 'Exists') {
+                $collection = self::applyWheres($where['query'], $collection);
             }
         }
 
@@ -436,12 +476,20 @@ class FakeDB
     {
         $orderBy = $query->orders;
         $selects = $query->columns;
+        $groups = $query->groups;
         $offset = $query->offset;
         $limit = $query->limit;
         $from = $query->from;
         $joins = $query->joins ?? [];
         $base = FakeDB::$fakeRows[$from] ?? [];
         $collection = FakeDB::performJoins($base, $joins);
+
+        if ($groups) {
+            foreach ($groups as &$group) {
+                $group = $from.'.'.$group;
+            }
+            $collection = $collection->groupBy($groups);
+        }
 
         foreach ($orderBy ?: [] as $i => $_order) {
             if (isset($_order['column'])) {
@@ -489,7 +537,7 @@ class FakeDB
     {
         foreach ($values as $_key => $_val) {
             if (is_object($_val) && get_class($_val) === Expression::class) {
-                $tokens = token_get_all('<?php '.$_val->getValue());
+                $tokens = token_get_all('<?php '.$_val->getValue(new FakeGrammar()));
                 array_shift($tokens);
                 foreach ($tokens as $i => $token) {
                     $type = $token[0];
@@ -518,11 +566,100 @@ class FakeDB
         return FakeDB::syncTable($collection, $builder->from);
     }
 
+    public static function upsert($query)
+    {
+        $values = $query['values'];
+        $uniqueBy = $query['uniqueBy'];
+        $query = $query['builder'];
+        $from = $query->from;
+
+        foreach ($values as $value) {
+            $shouldInsert = true;
+            $i = 0;
+            foreach (self::$fakeRows[$from] ?? [] as $i => $_row) {
+                $allMatch = true;
+                foreach ($uniqueBy as $uniqueCol) {
+                    if ($_row[$from][$uniqueCol] !== $value[$uniqueCol]) {
+                        $allMatch = false;
+                        break;
+                    }
+                }
+                if ($allMatch) {
+                    $shouldInsert = false;
+                    break;
+                }
+            }
+
+            if ($shouldInsert) {
+                self::addRow($from, $value);
+            } else {
+                self::$fakeRows[$from][$i][$from] = $value;
+            }
+        }
+    }
+
     public static function exec($query)
     {
         $type = $query['type'];
 
         return self::$type($query);
+    }
+
+    public static function columnListing($query)
+    {
+        $dbName = $query['bindings'][0];
+        $table = $query['bindings'][1];
+
+        $cols = [];
+        foreach (self::$schema[$table]['columns'] as $column) {
+            /**
+             * @var \Illuminate\Database\Schema\ColumnDefinition $column
+             */
+            $cols[] = $column->getAttributes()['name'];
+        }
+
+        return $cols;
+    }
+
+    public static function dropColumns($table, $cols)
+    {
+        foreach (self::$schema[$table]['columns'] as $i => $column) {
+            /**
+             * @var \Illuminate\Database\Schema\ColumnDefinition $column
+             */
+            if (in_array($column->getAttributes()['name'], $cols)) {
+                unset(self::$schema[$table]['columns'][$i]);
+            }
+        }
+    }
+
+    public static function tableExists($query)
+    {
+        $dbName = $query['bindings'][0];
+        $table = $query['bindings'][1];
+
+        return isset(self::$schema[$table]) ? [1] : [];
+    }
+
+    public static function getAllTables()
+    {
+        return array_keys(self::$schema);
+    }
+
+    public static function dropTable($table)
+    {
+        unset(self::$schema[$table]);
+    }
+
+    public static function renameTable($from, $to)
+    {
+        self::$schema[$to] = self::$schema[$from];
+        unset(self::$schema[$from]);
+    }
+
+    public static function dropAllTables()
+    {
+        self::$schema = [];
     }
 
     public static function exists($query)
@@ -539,8 +676,8 @@ class FakeDB
         $builder = $query['builder'];
 
         if ($aggregate = $builder->aggregate) {
-            $function = $aggregate["function"];
-            $columns = $aggregate["columns"];
+            $function = $aggregate['function'];
+            $columns = $aggregate['columns'];
 
             return self::aggregate($columns, $builder, $function);
         }
@@ -602,5 +739,27 @@ class FakeDB
         $result = ['aggregate' => self::filter($builder, ['*'])->$function($columns)];
 
         return [0 => $result];
+    }
+
+    private static function applyWhereColumns($where): Collection
+    {
+        [$table1, $column1] = explode('.', $where['first']);
+        [$table2, $column2] = explode('.', $where['second']);
+        $op = $where['operator'];
+        if ($op === '=' || $op === '==') {
+            $op = '===';
+        }
+
+        $result = array_filter(self::$fakeRows[$table1], function ($row) use ($table1, $table2, $column1, $column2, $op) {
+            foreach (self::$fakeRows[$table2] as $row2) {
+                if (eval('return $row[$table1][$column1] '.$op.' $row2[$table2][$column2];')) {
+                    return true;
+                }
+            }
+
+            return false;
+        });
+
+        return new Collection($result);
     }
 }

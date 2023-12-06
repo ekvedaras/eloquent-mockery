@@ -5,22 +5,35 @@ namespace Imanghafoori\EloquentMockery;
 use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Schema\MySqlBuilder;
 use Illuminate\Support\Arr;
 
 class FakeConnection extends Connection implements ConnectionInterface
 {
-    protected $pretending = true;
-
-    public static function resolve()
+    public static function resolve($connection = null, $db = '', $prefix = '', $config = ['name' => 'arrayDB'])
     {
-        return new FakeConnection(function () {
+        $fakeConnection = new FakeConnection(function () {
             return new FakePDO;
-        });
+        }, $db, $prefix, $config);
+
+        $fakeConnection->setQueryGrammar(new FakeGrammar);
+        
+        return $fakeConnection;
     }
 
     public function transaction(Closure $callback, $attempts = 1)
     {
         return $callback();
+    }
+
+    public function getSchemaBuilder()
+    {
+        return new MySqlBuilder($this);
+    }
+
+    public function getSchemaGrammar()
+    {
+        return $this->getDefaultSchemaGrammar();
     }
 
     public function query()
@@ -37,22 +50,77 @@ class FakeConnection extends Connection implements ConnectionInterface
 
     public function statement($query, $bindings = [])
     {
-        $query = $query->data;
+        if (is_object($query)) {
+            $query = $query->data;
+        } else {
+            
+        }
+        if (FakeSchemaGrammar::$query && is_string($query)) {
+            $payload = array_shift(FakeSchemaGrammar::$query);
+            $query = [
+                'sql' => $query,
+                'args' => $payload['args'] ?? null,
+                'type' => $payload['type'],
+            ];
+        }
+
         if (is_string($query)) {
             return parent::statement($query);
         }
 
-        return $this->run($query['sql'], $bindings, function () use ($query) {
-            return (bool) FakeDB::insertGetId($query['value'], $query['builder']->from);
+        $pretending = true;
+
+        return $this->run($query['sql'], $bindings, function () use ($query, $pretending) {
+            if ($this->pretending()) {
+                return $pretending;
+            }
+
+            if ($query['type'] === 'createTable') {
+                FakeDB::createTable($query['args']);
+            } elseif ($query['type'] === 'index') {
+            } elseif ($query['type'] === 'primary') {
+            } elseif ($query['type'] === 'autoIncrementStartValue') {
+            } elseif ($query['type'] === 'change') {
+            } elseif ($query['type'] === 'enableForeignKeyConstraints') {
+            } elseif ($query['type'] === 'disableForeignKeyConstraints') {
+            } elseif ($query['type'] === 'dropColumn') {
+                [$blueprint, $fluent] = $query['args'];
+                foreach ($blueprint->getCommands() as $fluentCommand) {
+                    $cols = $fluentCommand->getAttributes()['columns'];
+                    FakeDB::dropColumns($blueprint->getTable(), $cols);
+                }
+            } elseif ($query['type'] === 'drop') {
+                [$blueprint, $fluent] = $query['args'];
+                FakeDB::dropTable($blueprint->getTable());
+            } elseif ($query['type'] === 'dropAllTables') {
+                FakeDB::dropAllTables();
+            } elseif ($query['type'] === 'dropIfExists') {
+                [$blueprint, $fluent] = $query['args'];
+                FakeDB::dropTable($blueprint->getTable());
+            } elseif ($query['type'] === 'rename') {
+                [$blueprint, $fluent] = $query['args'];
+
+                /**
+                 * @var $blueprint \Illuminate\Database\Schema\Blueprint
+                 */
+                $from = $blueprint->getTable();
+                $to = $blueprint->getCommands()[0]->getAttributes()['to'];
+
+                FakeDB::renameTable($from, $to);
+            } else {
+                return (bool) FakeDB::insertGetId($query['value'], $query['builder']->from);
+            }
         });
     }
 
     public function select($query, $bindings = [], $useReadPdo = true)
     {
-        $query = $query->data;
-        return $this->run($query['sql'], $bindings, function () use ($query) {
-            return FakeDb::exec($query);
-        });
+        return $this->runFake($query->data, $bindings, []);
+    }
+
+    public function cursor($query, $bindings = [], $useReadPdo = true)
+    {
+        return $this->runFake($query->data, $bindings, []);
     }
 
     public function affectingStatement($query, $bindings = [])
@@ -66,15 +134,33 @@ class FakeConnection extends Connection implements ConnectionInterface
             return Arr::isAssoc($query['value']) ? 1 : count($query['value']);
         }
 
-        if (in_array($type, ['update', 'delete'])) {
-            return $this->select($queryObj, $bindings);
+        if (in_array($type, ['update', 'delete', 'truncate', 'upsert'])) {
+            return $this->runFake($query, $bindings, 0);
         }
+    }
 
-        if (is_array($query) && isset($query['uniqueBy'])) {
-            $sql = $query['sql'];
-            $query = $query['builder'];
-            $values = $query['values'];
-            $uniqueBy = $query['uniqueBy'];
-        }
+    protected function runFake($data, $bindings, $pretend)
+    {
+        return $this->run($data['sql'], $bindings, function () use ($data, $pretend, $bindings) {
+            if ($this->pretending()) {
+                return $pretend;
+            }
+
+            $data['bindings'] = $bindings;
+
+            return FakeDb::exec($data);
+        });
+    }
+
+    /**
+     * Get the default schema grammar instance.
+     *
+     * @return \Illuminate\Database\Schema\Grammars\Grammar
+     */
+    protected function getDefaultSchemaGrammar()
+    {
+        $grammar = new FakeSchemaGrammar();
+
+        return $this->withTablePrefix($grammar);
     }
 }
